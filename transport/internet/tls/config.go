@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -19,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/platform/filesystem"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
 )
 
 var globalSessionCache = tls.NewLRUClientSessionCache(128)
@@ -45,13 +47,15 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
 	return root, nil
 }
 
-// BuildCertificates builds a list of TLS certificates from proto definition.
-func (c *Config) BuildCertificates() []*tls.Certificate {
-	certs := make([]*tls.Certificate, 0, len(c.Certificate))
+// BuildCertificates publishes immutable TLS certificates from proto definition.
+func (c *Config) BuildCertificates() []*atomic.Pointer[tls.Certificate] {
+	certs := make([]*atomic.Pointer[tls.Certificate], 0, len(c.Certificate))
 	for _, entry := range c.Certificate {
 		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
 		}
+		// Reload workers own their PEM bytes; the shared config stays immutable.
+		entry = proto.Clone(entry).(*Certificate)
 		getX509KeyPair := func() *tls.Certificate {
 			keyPair, err := tls.X509KeyPair(entry.Certificate, entry.Key)
 			if err != nil {
@@ -65,14 +69,15 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 			}
 			return &keyPair
 		}
-		if keyPair := getX509KeyPair(); keyPair != nil {
-			certs = append(certs, keyPair)
-		} else {
+		keyPair := getX509KeyPair()
+		if keyPair == nil {
 			continue
 		}
-		index := len(certs) - 1
+		current := new(atomic.Pointer[tls.Certificate])
+		current.Store(keyPair)
+		certs = append(certs, current)
 		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
-			cert := certs[index]
+			cert := current.Load()
 			if isReloaded {
 				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
 					cert = newKeyPair
@@ -84,10 +89,14 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 				if newOCSPData, err := ocsp.GetOCSPForCert(cert.Certificate); err != nil {
 					errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
 				} else if string(newOCSPData) != string(cert.OCSPStaple) {
-					cert.OCSPStaple = newOCSPData
+					// Handshakes retain old pointers after selection, so never
+					// mutate an already published certificate or its staple.
+					updated := *cert
+					updated.OCSPStaple = newOCSPData
+					cert = &updated
 				}
 			}
-			certs[index] = cert
+			current.Store(cert)
 		})
 	}
 	return certs
@@ -105,6 +114,7 @@ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstaplin
 			isOcspstapling = true
 		}
 		t := time.NewTicker(time.Duration(hotReloadCertInterval) * time.Second)
+		defer t.Stop()
 		for {
 			var isReloaded bool
 			if entry.CertificatePath != "" && entry.KeyPath != "" {
@@ -243,20 +253,21 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
 	}
 }
 
-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getNewGetCertificateFunc(certs []*atomic.Pointer[tls.Certificate], rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		if len(certs) == 0 {
 			return nil, errNoCertificates
 		}
 		sni := strings.ToLower(hello.ServerName)
 		if !rejectUnknownSNI && (len(certs) == 1 || sni == "") {
-			return certs[0], nil
+			return certs[0].Load(), nil
 		}
 		gsni := "*"
 		if index := strings.IndexByte(sni, '.'); index != -1 {
 			gsni += sni[index:]
 		}
-		for _, keyPair := range certs {
+		for _, current := range certs {
+			keyPair := current.Load()
 			if keyPair.Leaf.Subject.CommonName == sni || keyPair.Leaf.Subject.CommonName == gsni {
 				return keyPair, nil
 			}
@@ -269,7 +280,7 @@ func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) f
 		if rejectUnknownSNI {
 			return nil, errNoCertificates
 		}
-		return certs[0], nil
+		return certs[0].Load(), nil
 	}
 }
 
