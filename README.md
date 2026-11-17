@@ -1,5 +1,13 @@
 # Project X
 
+## Fork changes
+
+This fork includes a local REALITY backend with P-256, P-384, and P-521 target
+support and TLS HelloRetryRequest handling. Existing X25519 authentication keys
+remain unchanged.
+See [backend notes](transport/internet/reality/handshake/README.md) for provenance,
+compatibility, and verification.
+
 [Project X](https://github.com/XTLS) originates from XTLS protocol, providing a set of network tools such as [Xray-core](https://github.com/XTLS/Xray-core) and [REALITY](https://github.com/XTLS/REALITY).
 
 [README](https://github.com/XTLS/Xray-core#readme) is open, so feel free to submit your project [here](https://github.com/XTLS/Xray-core/pulls).

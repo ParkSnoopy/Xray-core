@@ -25,12 +25,12 @@ import (
 	"unsafe"
 
 	utls "github.com/refraction-networking/utls"
-	"github.com/xtls/reality"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
+	reality "github.com/xtls/xray-core/transport/internet/reality/handshake"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"golang.org/x/net/http2"
 )
@@ -73,6 +73,7 @@ type UConn struct {
 	ServerName          string
 	AuthKey             []byte
 	Verified            bool
+	serverHello         *serverHelloConn
 	suppressCloseNotify atomic.Bool
 }
 
@@ -113,7 +114,14 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 			if len(c.Config.Mldsa65Verify) > 0 {
 				if len(certs[0].Extensions) > 0 {
 					h.Write(c.HandshakeState.Hello.Raw)
-					h.Write(c.HandshakeState.ServerHello.Raw)
+					if c.serverHello == nil {
+						return errors.New("REALITY: missing final ServerHello for ML-DSA verification")
+					}
+					serverHello := c.serverHello.finalHello()
+					if len(serverHello) == 0 {
+						return errors.New("REALITY: missing final ServerHello for ML-DSA verification")
+					}
+					h.Write(serverHello)
 					verify, _ := mldsa.NewPublicKey(mldsa.MLDSA65(), c.Config.Mldsa65Verify)
 					if mldsa.Verify(verify, h.Sum(nil), certs[0].Extensions[0].Value, nil) == nil {
 						c.Verified = true
@@ -143,6 +151,11 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	localAddr := c.LocalAddr().String()
 	uConn := &UConn{
 		Config: config,
+	}
+	if len(config.Mldsa65Verify) > 0 {
+		uConn.serverHello = &serverHelloConn{Conn: c}
+		c = uConn.serverHello
+		defer uConn.serverHello.clear()
 	}
 	utlsConfig := &utls.Config{
 		VerifyPeerCertificate:  uConn.VerifyPeerCertificate,

@@ -9,9 +9,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/xtls/reality"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet"
+	reality "github.com/xtls/xray-core/transport/internet/reality/handshake"
 )
 
 func (c *Config) GetREALITYConfig() *reality.Config {
